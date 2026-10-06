@@ -1,0 +1,17 @@
+#!/usr/bin/env python3
+"""
+BHTTP/1 Server implementation (Track 1).
+Usage: ./bserve ROOT PORT [HOST]
+"""
+import sys
+import os
+
+# Add repo_bhttp/tests/interop/python_server to python path
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "repo_bhttp", "tests", "interop", "python_server"))
+import bhttp_server
+
+if __name__ == "__main__":
+    if len(sys.argv) < 3:
+        sys.stderr.write("Usage: ./bserve ROOT PORT [HOST]\n")
+        sys.exit(2)
+    sys.exit(bhttp_server.main())
