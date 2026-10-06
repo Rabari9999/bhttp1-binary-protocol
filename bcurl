@@ -1,0 +1,135 @@
+#!/usr/bin/env python3
+"""
+BHTTP/1 Client implementation (Track 2).
+Usage: ./bcurl [-v] [HOST:PORT/PATH]
+Example: ./bcurl -v localhost:9000/index.html
+"""
+import sys
+import os
+import socket
+import struct
+import urllib.parse
+
+# Add repo_bhttp path
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "repo_bhttp", "tests", "interop", "python_client"))
+import bhttp_client as b
+
+def format_hexdump(data, prefix=""):
+    lines = []
+    for i in range(0, len(data), 16):
+        chunk = data[i:i+16]
+        hex_str = " ".join(f"{b:02X}" for b in chunk)
+        ascii_str = "".join(chr(b) if 32 <= b <= 126 else "." for b in chunk)
+        lines.append(f"{prefix}{i:04X}  {hex_str:<47}  |{ascii_str}|")
+    return "\n".join(lines)
+
+def hex_dump_frame(direction, raw_bytes, frame_obj=None):
+    type_names = {1: "REQUEST", 2: "RESPONSE", 3: "DATA", 4: "ERROR"}
+    tname = type_names.get(frame_obj.type if frame_obj else raw_bytes[4], f"UNKNOWN(0x{raw_bytes[4]:02X})")
+    sys.stderr.write(f"\n--- [{direction}] Frame ({tname}, {len(raw_bytes)} total bytes) ---\n")
+    sys.stderr.write(format_hexdump(raw_bytes, prefix="  ") + "\n")
+
+def main():
+    args = sys.argv[1:]
+    verbose = False
+    if "-v" in args:
+        verbose = True
+        args.remove("-v")
+    
+    if not args:
+        sys.stderr.write("Usage: ./bcurl [-v] [HOST:PORT/PATH]\n")
+        sys.exit(2)
+        
+    url_str = args[0]
+    if not url_str.startswith("bhttp://") and not url_str.startswith("http://"):
+        url_str = "http://" + url_str
+        
+    parsed = urllib.parse.urlparse(url_str)
+    host = parsed.hostname or "localhost"
+    port = parsed.port or 9000
+    path = parsed.path or "/"
+    if parsed.query:
+        path += "?" + parsed.query
+        
+    try:
+        sock = socket.create_connection((host, port), timeout=10.0)
+    except Exception as e:
+        sys.stderr.write(f"Error connecting to {host}:{port}: {e}\n")
+        sys.exit(1)
+        
+    stream_id = 1
+    # Build REQUEST frame
+    hdr_bytes = b.encode_headers([]) # no custom headers by default
+    path_bytes = path.encode("utf-8")
+    req_payload = struct.pack(">BH", b.METHOD_GET, len(path_bytes)) + path_bytes + hdr_bytes
+    req_frame = b.pack_frame(b.T_REQUEST, b.END_STREAM, stream_id, req_payload)
+    
+    if verbose:
+        hex_dump_frame("CLIENT -> SERVER", req_frame, frame_obj=b.Frame(len(req_payload), b.T_REQUEST, b.END_STREAM, 0, stream_id, req_payload))
+        
+    sock.sendall(req_frame)
+    
+    # Read response frames
+    client = b.Client(host, port, sock=sock)
+    client.next_stream = stream_id
+    
+    got_response = False
+    status_code = 0
+    body_chunks = []
+    
+    while True:
+        try:
+            # Read exact 12 byte header
+            hdr_raw = b.read_exact(sock, 12)
+            length, ftype, flags, reserved, sid = b.FRAME_HDR.unpack(hdr_raw)
+            payload_raw = b.read_exact(sock, length) if length > 0 else b""
+            raw_frame_bytes = hdr_raw + payload_raw
+            
+            frame = b.Frame(length, ftype, flags, reserved, sid, payload_raw)
+            
+            if verbose:
+                hex_dump_frame("SERVER -> CLIENT", raw_frame_bytes, frame)
+                
+            if ftype not in (b.T_REQUEST, b.T_RESPONSE, b.T_DATA, b.T_ERROR):
+                # Unknown frame type: skip cleanly!
+                continue
+                
+            if ftype == b.T_ERROR:
+                code, msg = b.decode_error(payload_raw)
+                sys.stderr.write(f"Server sent ERROR code={code} msg={msg}\n")
+                sock.close()
+                sys.exit(1)
+                
+            if ftype == b.T_RESPONSE:
+                got_response = True
+                status_code, headers = b.decode_response(payload_raw)
+                if verbose:
+                    sys.stderr.write(f"Response Status: {status_code}\n")
+                    for _hid, hname, hval in headers:
+                        hname_str = hname if isinstance(hname, str) else (hname.decode("utf-8", "replace") if hname else f"ID({_hid})")
+                        hval_str = hval.decode("utf-8", "replace") if isinstance(hval, bytes) else str(hval)
+                        sys.stderr.write(f"  {hname_str}: {hval_str}\n")
+            elif ftype == b.T_DATA:
+                body_chunks.append(payload_raw)
+                
+            if frame.end_stream:
+                break
+        except EOFError:
+            break
+        except Exception as e:
+            sys.stderr.write(f"Protocol/read error: {e}\n")
+            sock.close()
+            sys.exit(1)
+            
+    sock.close()
+    
+    full_body = b"".join(body_chunks)
+    sys.stdout.buffer.write(full_body)
+    sys.stdout.buffer.flush()
+    
+    if status_code >= 400 or status_code == 0:
+        sys.exit(1)
+    sys.exit(0)
+
+if __name__ == "__main__":
+    main()
